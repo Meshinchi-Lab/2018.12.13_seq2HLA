@@ -1,0 +1,889 @@
+---
+title: 'HLA-typing with RNAseq'
+author: "Jenny Smith"
+date: "August 6, 2019"
+output: html_document
+---
+
+
+
+#Set-up
+
+```{r setup}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center', fig.height=5, fig.width=8)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,'2018.12.13_seq2HLA/'))
+options(stringsAsFactors = FALSE)
+table = function (..., useNA = 'always') base::table(..., useNA = useNA)
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(gtools)
+getwd()
+```
+
+```{r}
+source("~/scripts/conversion_scripts/Merge_Cat_FixDupIDs_Function.r")
+```
+
+
+#Read in the Clinical Data
+
+```{r}
+merged <- read.csv(file.path(CDE,"Merged/TARGET_AML_0531_1031_merged_CDEs_9.18.20.csv"))
+
+merged <- merged %>%
+  filter(!is.na(USI), USI != "Unknown")
+
+head(merged[,1:5])
+dim(merged)
+```
+
+
+```{r}
+manifest <- read.csv(file.path(TARGET,"SequencingDataMatrix/TARGET_AML_Ribodepleted_Manifest_10.08.20.csv"))
+
+head(manifest)
+dim(manifest)
+```
+
+
+```{r}
+bam_manifest <- read.csv(file.path(TARGET,"SequencingDataMatrix/BAM_manifests/TARGET_AML_Ribodepleted_RNAseq_Bam_Manifest_10.02.20.csv"), row.names = 1) %>% 
+  bind_rows(.,  read.csv(file.path(TARGET,"SequencingDataMatrix/BAM_manifests/TARGET_AML_polyA_RNAseq_Bam_Manifest_10.02.20.csv"))) %>% 
+  mutate(filename=gsub(".bam", "", filename)) %>% 
+  select(Sample, Lib_Prep,Batch,PATIENT_ID_Original, filename)
+
+dim(bam_manifest) #2855    5
+```
+
+
+```{r eval=FALSE}
+# Replicates were determined using the manifests in the SequencingDataMatrix/ directory.
+#these are the replicates for batch 1 to batch 2
+# rep_b12=(TARGET-20-PAXLDJ-09A-01R TARGET-20-PAXGYZ-03A-01R TARGET-20-PAXEBW-09A-01R TARGET-20-PAWTSD-09A-01R TARGET-20-PAWMHE-09A-01R TARGET-20-PAWKIW-03A-01R TARGET-20-PAWEYY-09A-01R TARGET-20-PAVWRI-09A-01R TARGET-20-PAVTRU-09A-01R TARGET-20-PAVHWK-09A-01R TARGET-20-PAVBVP-09A-01R TARGET-20-PAUVIB-09A-01R TARGET-20-PAUUTI-09A-01R TARGET-20-PATISD-09A-01R TARGET-20-PATGIG-03A-01R TARGET-20-PATESX-09A-01R TARGET-20-PASRLS-09A-01R TARGET-20-PASLTF-09A-01R TARGET-20-PASIEJ-09A-01R TARGET-20-PARVSF-09A-01R TARGET-20-PALHWN-09A-01R TARGET-00-BM5776-14A-01R TARGET-00-BM5759-14A-01R TARGET-00-BM5756-14A-01R TARGET-00-BM5751-14A-01R TARGET-00-BM5682-14A-01R TARGET-00-BM5233-14A-01R TARGET-00-BM5136-09A-01R TARGET-00-BM5108-09A-01R TARGET-00-BM4641-14A-01R TARGET-00-BM4616-14A-01R TARGET-00-BM4508-14A-01R TARGET-00-BM4473-14A-01R TARGET-00-BM4404-14A-01R TARGET-00-BM4203-14A-01R TARGET-00-BM3969-14A-01R TARGET-00-BM3897-14A-01R )
+
+#relapse sample replicates 
+Reps_relapse <- c("TARGET-20-PAVNUW-03A-01R",
+"TARGET-20-PATGTL-03A-01R",
+"TARGET-20-PASMSZ-03A-01R",
+"TARGET-20-PAXWMS-03A-01R")
+
+
+
+manifest.RBD <- read.csv(file.path(TARGET,"SequencingDataMatrix/00_archive/TARGET_AML_Ribodepleted_Master_Manifest_2.14.20.csv"), na.strings = c("NA","","N/A","Unknown")) %>%
+  mutate(Barcode=gsub("\\.","-", gsub("_replicate","", Sample))) %>%
+  mutate_at(vars(Barcode),~ifelse(grepl("Sorted-CD34--09A",Barcode),
+                                  gsub("Sorted-CD34--09A","Sorted-CD34+-09A", Barcode), Barcode)) %>%
+  select(Sample,Barcode,USI, Protocol, Group:Time_point, Tissue)
+
+
+head(manifest.RBD)
+dim(manifest.RBD) #  2345    9
+# table(manifest.RBD$Protocol, useNA = 'ifany')
+
+
+
+
+manifest <- read.csv(file.path(TARGET,"SequencingDataMatrix/00_archive/TARGET_AML_RBD_0531_1031_miRNAseq_mRNAseq_Manifest_v5.csv")) %>%
+
+  #only include the mRNA-seq data sets 
+  filter(!(grepl("PATGIG|PATISD", Final_Patient_ID) & grepl("Replicate",Replicate))) %>%
+  filter(!is.na(mRNAseq_coverage.transcript.normalized)) %>%
+  select(everything(), Group=Type)  %>%
+  
+  #Create a column to merge with the RBD master manifest. 
+  mutate(Joining_IDs=case_when(
+    Final_Patient_ID %in% manifest.RBD$Barcode ~ Final_Patient_ID, 
+    PATIENT_ID_Original %in% manifest.RBD$Barcode ~ PATIENT_ID_Original)) %>% 
+  
+  arrange(PATIENT_ID_Original) 
+
+# head(manifest)
+# dim(manifest) #1574   18
+
+
+
+manifest.RBD_update <- manifest.RBD %>% 
+  left_join(., select(manifest,Final_Patient_ID,
+                      PATIENT_ID_Original,Joining_IDs), 
+            by=c("Barcode"="Joining_IDs")) %>% 
+  group_by(Sample) %>%
+  mutate(N=n(),
+         Keep=case_when(
+                      N == 1 ~ TRUE,
+                      N == 2 & grepl("R_replicate", Sample) ~ Final_Patient_ID == PATIENT_ID_Original,
+                      N == 2 & !grepl("R_replicate", Sample) ~ Final_Patient_ID != PATIENT_ID_Original)) %>%
+  filter(Keep) %>%
+  ungroup() %>% 
+  
+  mutate_at(vars(Final_Patient_ID, PATIENT_ID_Original), ~case_when(
+    is.na(.) ~ Barcode,
+    TRUE ~ .)) %>%
+  add_row(USI="S-1327", Sample="S.1327",
+          Final_Patient_ID="S-1327", PATIENT_ID_Original="S-1327", 
+          Group="AML", Time_point="relapse") %>% 
+  left_join(., select(merged, USI, Reg.,Protocol2=Protocol,
+                      Primary.Fusion, Additional.Fusions.CNV), 
+            by="USI") %>% 
+  
+  mutate(AML_Subtype=case_when(
+    grepl("CBFA2T3-GLIS2",Primary.Fusion) | grepl("CBFA2T3-GLIS2",Additional.Fusions.CNV) ~ "CBFA2T3-GLIS2", 
+    grepl("NUP98-KDM5A",Primary.Fusion) | grepl("NUP98-KDM5A",Additional.Fusions.CNV) ~ "NUP98-KDM5A",
+    grepl("RBM15-MKL1",Primary.Fusion) | grepl("RBM15-MKL1",Additional.Fusions.CNV) ~ "RBM15-MKL1",
+    grepl("NUP98-NSD1",Primary.Fusion) | grepl("NUP98-NSD1",Additional.Fusions.CNV) ~ "NUP98-NSD1", 
+    grepl("ETV[1-6]|FLI1|ERG|FUS|FEV|ELF[1-4]|ETS[1-2]",Primary.Fusion) |
+      grepl("ETV[1-6]|FLI1|ERG|FUS|FEV|ELF[1-4]|ETS[1-2]", Additional.Fusions.CNV) ~ "ETS-Fusion", 
+    grepl("CBFB-MYH11",Primary.Fusion) | grepl("CBFB-MYH11",Additional.Fusions.CNV) ~ "CBFB-MYH11", 
+    grepl("RUNX1-RUNX1T1",Primary.Fusion) | grepl("RUNX1-RUNX1T1",Additional.Fusions.CNV) ~ "RUNX1-RUNX1T1", 
+    grepl("KMT2A",Primary.Fusion) | grepl("KMT2A",Additional.Fusions.CNV) ~ "KMT2A", 
+    grepl("DEK-NUP214",Primary.Fusion) | grepl("DEK-NUP214",Additional.Fusions.CNV) ~ "DEK-NUP214",
+    grepl("monosomy7",Primary.Fusion) | grepl("monosomy7",Additional.Fusions.CNV) ~ "monosomy7",
+    grepl("del5q",Primary.Fusion) | grepl("del5q",Additional.Fusions.CNV) ~ "del5q",
+    grepl("None",Primary.Fusion)  ~ "No.Primary.Fusion",
+    TRUE ~ Group)) %>%
+  
+  mutate_at(vars(AML_Subtype), ~ifelse(.=="FlowSorted", "AML", .)) %>%
+  mutate_at(vars(Protocol), ~case_when(
+    is.na(.) & !is.na(Protocol2) ~ Protocol2,
+    is.na(.) & is.na(Protocol2) ~ Group,
+    TRUE ~ .)) %>%
+  
+  
+  select(Sample,Final_Patient_ID,PATIENT_ID_Original,USI,Reg., 
+         Protocol,AML_Subtype,Group, everything(),
+         -Barcode, -Keep, -N,-Protocol2,
+         Primary.Fusion, Additional.Fusions.CNV)
+  
+  
+
+dim(manifest.RBD)
+dim(manifest.RBD_update)
+head(manifest.RBD_update)
+# write.csv(manifest.RBD_update, file.path(TARGET,"SequencingDataMatrix/TARGET_AML_Ribodepleted_Master_Manifest_8.5.20.csv"))
+
+rm(manifest.RBD, manifest)
+
+table(manifest.RBD_update$Protocol, useNA='ifany')
+table(manifest.RBD_update$Group, useNA='ifany')
+# table(manifest.RBD_update$AML_Subtype,useNA='ifany')
+# View(select(manifest.RBD_update, USI,Sample, Final_Patient_ID,PATIENT_ID_Original))
+```
+
+
+
+#Read in the Counts
+
+```{r}
+# TPM <- readRDS(file.path(PROJHOME,"0000.00.03_ExpressionMatrices/TARGET_AML_DSAML_MPN_NBM_Ribodepleted_dupGenesRemoved_TPM.RDS"))
+TPM <- readRDS(file.path(PROJHOME,"0000.00.03_ExpressionMatrices/TARGET_AML_MPN_DS_NBM_2418Samples_Ribodepleted_RNAseq_geneLevel_dupGenesRemoved_FractionalCounts.RDS"))
+
+dim(TPM) #51573  2345
+```
+
+```{r}
+s <- filter(manifest.RBD_update, Group=="AML", Time_point =="diagnostic")
+
+TPM.long <- TPM %>% 
+  rownames_to_column("Gene") %>% 
+  gather(Sample,TPM,-Gene) %>%
+  filter(Sample %in% s$Sample) %>%
+
+
+
+# head(TPM.long)
+```
+
+```{r}
+
+mintpm <- min(log2(TPM.long$TPM+1)) #0
+maxtpm <- max(log2(TPM.long$TPM+1)) #19.5
+  
+hist <- ggplot(data=TPM.long, aes(x=log2(TPM+1))) +
+  geom_histogram(binwidth = 0.5, fill="blue",color="blue") +
+  geom_vline(xintercept = log2(1+1), color="grey50", linetype="dashed") + 
+  geom_vline(xintercept = log2(2+1), color="red", linetype="dashed") + 
+  labs(y="Frequency of TPM Value", title = "RNA-seq Gene Expression Distribution") + 
+  scale_x_continuous(breaks = seq(mintpm,maxtpm, by=1)) +
+  theme_bw()
+
+hist
+```
+
+```{r}
+# ggsave(plot = hist,filename = "TARGET_AML_RNA-seq_Gene_Expression_Hist.pdf", device = "pdf", height = 4, width = 5)
+```
+
+
+#Bash Seq2HLA Job Submission
+
+
+```{bash}
+aws s3 ls s3://fh-pi-meshinchi-s/SR/picard_fq2/ | grep -E ".gz" > fastqs.txt 
+cat fastqs.txt | grep -E "r1.fq.gz" > r1
+cat fastqs.txt | grep -E "r2.fq.gz" > r2
+paste r1 r2  > samples_to_HLAtype.txt
+
+PREFIX="SR/picard_fq2"
+sbatch ~/scripts/sbatch_jobs/seq2HLA_7.24.20.sh samples_to_HLAtype.txt $PREFIX
+
+```
+
+## Re-Do
+
+```{r}
+AWS_S3_Fastq_Manifest <- read.csv(file.path(TARGET, "SequencingDataMatrix/00_archive/TARGET_AML_RBD_PolyA_AWS_S3_Fastq_Manifest_8.5.20.csv")) 
+
+dim(AWS_S3_Fastq_Manifest)
+```
+
+```{r}
+# table(AWS_S3_Fastq_Manifest$Sample %in% bam_manifest$Sample) #those are 4 missing bams from Symlink directory
+# table(bam_manifest$Sample %in% AWS_S3_Fastq_Manifest$Sample) #missing from Seq2HLA??
+
+dl_fails <- read.table(file.path(SCRATCH,"jlsmith3/Seq2HLA/seq2HLA_download_failed.txt"),
+                       sep="\t",header = FALSE,col.names = "stderr") %>% 
+  separate(stderr,into=c("stderr","error","r1","x","dest"),sep=" ") %>%
+  mutate(PATIENT_ID_Original=gsub("^.+2\\/([PBKM].+R)_.+r[0-9].fq.gz", "\\1", r1)) %>%
+  select(PATIENT_ID_Original,everything())
+
+missingData <- bam_manifest %>% 
+  filter(!Sample %in% AWS_S3_Fastq_Manifest$Sample) %>% 
+  filter(!grepl("IX", filename)) #these are the high depth NBM that I haven't made fastqs/processed
+
+# missingData #57/59 were due to download failures from S3. 
+# table(missingData$Lib_Prep) #59 RBS need to be rescued 
+
+regex <- pull(missingData,PATIENT_ID_Original) %>% paste(., collapse="|")
+regex
+```
+
+```{bash}
+grep -E -H "download failed:" *err > seq2HLA_download_failed.txt
+samps=$(cat seq2HLA_download_failed.txt | cut -f 3 -d " " | cut -f 6 -d "/" | sed -E "s/^(.+)$/\^\1\\\b/" )
+regex=$(echo $samps | tr " " "|")
+cat Seq2HLA/samples_to_HLAtype.txt | grep -E $regex > Seq2HLA/samps_redo_to_HLAtype.txt
+PREFIX="SR/picard_fq2"
+sbatch ~/scripts/sbatch_jobs/seq2HLA_7.24.20.sh samps_redo_to_HLAtype.txt $PREFIX
+```
+
+
+
+
+#Define files 
+
+```{r}
+path <- file.path(SCRATCH,"jlsmith3/Seq2HLA")
+files <- dir(path=path, recursive=TRUE, full.names = TRUE)
+length(files) #43040
+
+head(files)
+```
+
+
+```{r}
+classI.2dig <-  grep("ClassI-class.HLAgenotype2digits", files, value=TRUE) %>% 
+  grep("test", ., value=T, invert = T)
+
+
+classI.4dig <- grep("ClassI-class.HLAgenotype4digits", files, value=TRUE) %>% 
+  grep("test", ., value=T, invert = T)
+
+
+length(classI.2dig) #2834
+length(classI.4dig) #2834
+```
+
+```{r}
+classII.2dig <-  grep("ClassII.HLAgenotype2digit", files, value=TRUE) %>% 
+  grep("test", ., value=T, invert = T)
+
+
+classII.4dig <- grep("ClassII.HLAgenotype4digits", files, value=TRUE) %>% 
+  grep("test", ., value=T, invert = T)
+
+
+length(classII.2dig) #2834
+length(classII.4dig) #2834
+```
+
+
+
+
+#Create Data Manifest
+
+Quirky File naming conventions in the fastqs...
+
+1.	Batch 1 Ribodepleted: samples do not begin with TARGET
+2.	Batch 2 Ribodepeleted: samples begin with TARGET and have “_RBS_” ( we were calling them RBS for a while, than RBD).
+3.	Low Depth 0531: samples begin with TARGET and lack “_RBS_”. As the names like “_2_lane_” etc, those came from BCCA directly since they did some merging of raw data from 2 lanes of a flow cell for the same sample.
+4.	In the manifest for RBD: The column “PATIENT_ID_Original” will be the target barcode that matches the sample names.
+
+
+```{r}
+HLA.manifest <- read.csv("TARGET_AML_RBD_PolyA_Seq2HLA_Manifest_11.17.20.csv")
+
+dim(HLA.manifest) #2834   18
+
+# table(duplicated(HLA.manifest$Sample))
+# any(duplicated(HLA.manifest$filename))
+```
+
+```{r}
+pattern <- "^.+[dt]/([A-Z].+)-ClassI.+$"
+```
+
+```{r eval=FALSE}
+HLA.manifest <- data.frame(filepath_2dig=classI.2dig,
+                           filepath_4dig=classI.4dig,
+                           filename=gsub(pattern, "\\1",classI.2dig)) %>% 
+  mutate(Patient_ID=str_split_fixed(filename, pattern = "_", n=6)[,1]) %>% 
+  mutate(Lib_Prep=str_split_fixed(filename, pattern = "_", n=6)[,2]) %>%
+  mutate_at(vars(Lib_Prep),~ifelse(. != "RBS", NA, .))  %>% 
+  mutate_at(vars(Lib_Prep),~case_when(
+    is.na(.) & grepl("^[BPRSKM]", Patient_ID) ~ "RBS",
+    is.na(.) & grepl("^TARGET", Patient_ID) ~ "PolyA",
+    TRUE ~ .))
+
+HLA.manifest.RBD <- HLA.manifest %>% 
+  filter(Lib_Prep=="RBS") %>%
+  select(-Lib_Prep) %>% 
+  arrange(Patient_ID) %>%
+  left_join(., manifest,
+            by=c("Patient_ID"="PATIENT_ID_Original")) %>% #this merge is adding 3 additional dups...
+  #The PASMSZ,PATGTL,PAXWMS samples from the relapse batch we not turned in fastqs. Only the originals form the diagnostic batch dx2 were 
+  filter(!duplicated(Sample), !grepl("(PASMSZ|PATGTL|PAXWMS).+_replicate", Sample))
+
+# View(HLA.manifest.RBD)
+# dim(HLA.manifest.RBD) #2342   18
+
+HLA.manifest.ployA <- HLA.manifest %>% 
+  filter(Lib_Prep!="RBS") %>% 
+  mutate(USI=str_split_fixed(Patient_ID, pattern = "-", n=5)[,3],
+         Group=ifelse(grepl("BM[0-9]", Patient_ID), "NBM","AML"), 
+         Sample=gsub("-",".", Patient_ID) %>% 
+           ifelse(grepl("Replicate", filename),  paste0( ., "_replicate"), .),
+         Time_point=case_when(
+           Group == "NBM" ~ "NBM",
+           grepl("03A|09A", Patient_ID) ~ "diagnostic",
+           grepl("04A|40A", Patient_ID) ~ "relapse"),
+         Tissue=case_when(
+           Group == "NBM" ~ "NBM",
+           grepl("03A", Patient_ID) ~ "peripheral blood",
+           grepl("09A", Patient_ID) ~ "bone marrow"),
+         Batch=Lib_Prep) %>%
+  left_join(., select(merged, USI, Protocol,Primary.CNV,
+                      Primary.Fusion, Additional.Fusions.CNV, ETS_Fusion), 
+            by="USI") %>% 
+  
+  mutate(AML_Subtype=case_when(
+    grepl("CBFA2T3-GLIS2",Primary.Fusion) | grepl("CBFA2T3-GLIS2",Additional.Fusions.CNV) ~ "CBFA2T3-GLIS2", 
+    grepl("NUP98-KDM5A",Primary.Fusion) | grepl("NUP98-KDM5A",Additional.Fusions.CNV) ~ "NUP98-KDM5A",
+    grepl("RBM15-MKL1",Primary.Fusion) | grepl("RBM15-MKL1",Additional.Fusions.CNV) ~ "RBM15-MKL1",
+    grepl("NUP98-NSD1",Primary.Fusion) | grepl("NUP98-NSD1",Additional.Fusions.CNV) ~ "NUP98-NSD1", 
+    grepl("ETS|ETV6|FUS-ERG",ETS_Fusion) ~ "ETS-Fusion", 
+    grepl("CBFB-MYH11",Primary.Fusion) | grepl("CBFB-MYH11",Additional.Fusions.CNV) ~ "CBFB-MYH11", 
+    grepl("RUNX1-RUNX1T1",Primary.Fusion) | grepl("RUNX1-RUNX1T1",Additional.Fusions.CNV) ~ "RUNX1-RUNX1T1", 
+    grepl("KMT2A",Primary.Fusion) | grepl("KMT2A",Additional.Fusions.CNV) ~ "KMT2A", 
+    grepl("DEK-NUP214",Primary.Fusion) | grepl("DEK-NUP214",Additional.Fusions.CNV) ~ "DEK-NUP214",
+    grepl("monosomy7",Primary.Fusion) | grepl("monosomy7",Additional.Fusions.CNV) ~ "monosomy7",
+    grepl("del5q",Primary.Fusion) | grepl("del5q",Additional.Fusions.CNV) ~ "del5q",
+    grepl("None",Primary.Fusion)  ~ "No.Primary.Fusion",
+    TRUE ~ Group)) 
+
+# dim(HLA.manifest.ployA) #492  15
+
+HLA.manifest <- HLA.manifest.RBD %>%
+  bind_rows(., HLA.manifest.ployA) %>% 
+  mutate_at(vars(Final_Patient_ID), ~ifelse(is.na(.), Patient_ID, .))  %>% 
+  select(USI,Sample,
+         Final_Patient_ID,
+         PATIENT_ID_Original=Patient_ID,
+         Lib_Prep,
+         filename:Primary.CNV,
+         Additional.Fusions.CNV,
+         filepath_2dig, filepath_4dig,
+         everything(),
+         -ETS_Fusion)
+
+
+# head(HLA.manifest)
+# tail(HLA.manifest)
+dim(HLA.manifest) #2834   18
+
+# rm(HLA.manifest.RBD,HLA.manifest.ployA)
+
+# write.csv(HLA.manifest, "TARGET_AML_RBD_PolyA_Seq2HLA_Manifest_11.17.20.csv", row.names = FALSE)
+# write.csv(dplyr::select(HLA.manifest,
+#                         fastq_sample_filename=filename, everything(),
+#                         -filepath_2dig,-filepath_4dig),
+#           "TARGET_AML_RBD_PolyA_Seq2HLA_Manifest_Shareable_11.17.20.csv",
+#           row.names = FALSE)
+
+# write.csv(dplyr::select(HLA.manifest, fastq_sample_filename=filename, everything(), -filepath_2dig,-filepath_4dig),
+#            file.path(TARGET, "SequencingDataMatrix/TARGET_AML_RBD_PolyA_AWS_S3_Fastq_Manifest_11.17.20.csv"),
+#           row.names = FALSE)
+```
+
+
+
+
+#Concatenate the HLA-typing Results 
+
+## MHC Class I 
+
+```{r}
+pattern <- "^.+[dt]/([A-Z].+)-ClassI.+$"
+```
+
+```{r}
+classI.2dig.cated <- catRbind(filenames = pull(HLA.manifest, filepath_2dig), 
+                              regex=pattern, 
+                         header=TRUE, sep="\t")
+```
+
+
+```{r}
+dim(classI.2dig.cated) #8502    6
+head(classI.2dig.cated) 
+# write.csv(classI.2dig.cated, "Results_Concat/TARGET_AML_2digit_seq2HLA_raw_11.17.20.csv", row.names = FALSE)
+```
+
+```{r}
+classI.4dig.cated <- catRbind(filenames = pull(HLA.manifest, filepath_4dig) ,
+                              regex=pattern, 
+                         header=TRUE, sep="\t")
+
+dim(classI.4dig.cated)
+head(classI.4dig.cated) #8502    6
+
+# write.csv(classI.4dig.cated, "Results_Concat/TARGET_AML_4digit_seq2HLA_raw_11.17.20.csv", row.names = FALSE)
+```
+
+## MHC Class II
+
+```{r}
+patternII <- "^.+[dt]/([A-Z].+)-ClassII.+$"
+```
+
+```{r}
+classII.2dig.cated <- catRbind(filenames = classII.2dig, 
+                              regex=patternII, 
+                         header=TRUE, sep="\t")
+
+head(classII.2dig.cated)
+dim(classII.2dig.cated) #17004     6
+
+# write.csv(classII.2dig.cated, "Results_Concat/TARGET_AML_ClassII_2digit_seq2HLA_raw_11.17.20.csv", row.names = FALSE)
+
+
+
+
+classII.4dig.cated <- catRbind(filenames = classII.4dig,
+                              regex=patternII, 
+                         header=TRUE, sep="\t")
+
+head(classII.4dig.cated)
+dim(classII.4dig.cated) #17004     6
+
+# write.csv(classII.4dig.cated, "Results_Concat/TARGET_AML_ClassII_4digit_seq2HLA_raw_11.17.20.csv", row.names = FALSE)
+```
+
+
+# Add Sample Annotations
+
+```{r}
+classI.2dig.cated <- read.csv("Results_Concat/TARGET_AML_2digit_seq2HLA_raw_11.17.20.csv")
+
+
+classI.2dig <- classI.2dig.cated %>% 
+  inner_join(., select(HLA.manifest,-filepath_2dig, -filepath_4dig), 
+             by=c("Patient"="filename")) 
+
+  
+  
+dim(classI.2dig)  #8499   21
+head(classI.2dig)
+
+# write.csv(classI.2dig, "Results_Concat/TARGET_AML_2digit_seq2HLA_annotated_11.17.20.csv", row.names = FALSE)
+
+
+
+classI.4dig.cated <- read.csv("Results_Concat/TARGET_AML_4digit_seq2HLA_raw_11.17.20.csv")
+
+
+classI.4dig <- classI.4dig.cated %>% 
+  inner_join(., select(HLA.manifest,-filepath_2dig, -filepath_4dig), 
+             by=c("Patient"="filename")) 
+
+  
+  
+dim(classI.4dig)  #8499   21
+head(classI.4dig)
+
+# write.csv(classI.4dig, "Results_Concat/TARGET_AML_4digit_seq2HLA_annotated_11.17.20.csv", row.names = FALSE)
+
+
+
+classII.2dig.cated <- read.csv("Results_Concat/TARGET_AML_ClassII_2digit_seq2HLA_raw_11.17.20.csv")
+
+
+classII.2dig <- classII.2dig.cated %>% 
+  inner_join(., select(HLA.manifest,-filepath_2dig, -filepath_4dig), 
+             by=c("Patient"="filename")) 
+  
+dim(classII.2dig)  #16998    21
+head(classII.2dig)
+
+# write.csv(classII.2dig, "Results_Concat/TARGET_AML_ClassII_2digit_seq2HLA_annotated_11.17.20.csv", row.names = FALSE)
+
+
+
+classII.4dig.cated <- read.csv("Results_Concat/TARGET_AML_ClassII_4digit_seq2HLA_raw_11.17.20.csv")
+
+
+classII.4dig <- classII.4dig.cated %>% 
+  inner_join(., select(HLA.manifest,-filepath_2dig, -filepath_4dig,), 
+             by=c("Patient"="filename")) 
+
+  
+  
+dim(classII.4dig)  #16998    21
+head(classII.4dig)
+
+# write.csv(classII.4dig, "Results_Concat/TARGET_AML_ClassII_4digit_seq2HLA_annotated_11.17.20.csv", row.names = FALSE)
+```
+
+
+
+
+#Determine HLA A*02 prevalence 
+
+```{r}
+classI.2dig <- read.csv("TARGET_AML_2digit_seq2HLA_annotated.csv")
+# filter(classI.2dig, grepl("A\\*02", Allele.1))
+ # filter(classI.2dig, grepl("A\\*02", Allele.2))
+```
+
+```{r}
+HLA.collapsed <- classI.2dig %>% 
+    mutate(HLA.A.02=ifelse(grepl("A\\*02", Allele.1)| grepl("A\\*02", Allele.2), TRUE,FALSE))
+  filter(X.Locus == "A") %>%
+  select(Patient, Patient_ID,Sample,Reg.,USI,
+         Allele.1, Confidence_Allele.1=Confidence, Allele.2, Confidence_Allele.2=Confidence.1,
+         HLA.A.02, Lib_Prep,Group,AML_Subtype, Time_point,Tissue,Batch) %>% 
+  unique()
+
+head(HLA.collapsed)
+# dim(HLA.collapsed) #2777    14
+```
+
+```{r}
+Tab.A02 <- HLA.collapsed %>% 
+  group_by(Group,Time_point,Lib_Prep,HLA.A.02) %>% 
+  summarise(Number_Samples=n()) %>% 
+  ungroup()
+
+
+Tab.A02
+# write.csv(Tab.A02, "TARGET_AML_HLA_A.02_Prevalence_RNA-seq_Cohorts.csv", row.names = FALSE)
+```
+
+47% have HLA A*02 in either allele. Seems a bit high
+
+
+#PRAME Expression 
+
+```{r}
+PRAME <- TPM["PRAME",] %>%
+  rownames_to_column("Gene") %>% 
+  gather(Sample,PRAME_TPM,-Gene) %>%
+  mutate(Log2_PRAME_TPM=log2(PRAME_TPM+1))
+
+
+head(PRAME)
+dim(PRAME) #2345    3
+```
+
+CSGH, PRAME_TPM 143.056
+
+```{r}
+HLA.collapsed.celllines <- HLA.collapsed %>% 
+  filter(Lib_Prep == "RBS", Group=="CellLine") %>%
+  inner_join(., PRAME, by="Sample") %>%
+  select(Sample:HLA.A.02, PRAME_TPM, everything(), -Patient,-Patient_ID, -Gene) %>% 
+  filter(HLA.A.02,
+         PRAME_TPM >= 5.0) %>% 
+  arrange(desc(Group),desc(PRAME_TPM))
+
+
+HLA.collapsed.celllines
+```
+
+
+```{r}
+HLA.collapsed.expn <- HLA.collapsed %>% 
+  filter(Time_point=="diagnostic",
+         grepl("AML",Group),
+         Lib_Prep == "RBS") %>%
+  inner_join(., PRAME, by="Sample") %>%
+  select(Sample:HLA.A.02, PRAME_TPM, everything(), -Patient,-Patient_ID, -Gene) %>%
+  mutate(PRAME_Expn_5TPM=ifelse(PRAME_TPM >= 5.0 , "Yes", "No"),
+         PRAME_Expn_1TPM=ifelse(PRAME_TPM >= 1.0 , "Yes", "No"),
+         PRAME_Expn_Deciles=quantcut(PRAME_TPM,q=10),
+         PRAME_Expn_Median=ifelse(PRAME_TPM >= median(PRAME_TPM) , "Yes", "No"),
+         PRAME_Expn_40pctile=ifelse(PRAME_TPM >= quantile(PRAME_TPM, probs=seq(0,1, length.out = 11))[7] , "Yes", "No")) %>%
+  arrange(desc(Group),desc(PRAME_TPM)) %>%
+  mutate(Index=as.factor(1:nrow(.))) 
+
+
+
+head(HLA.collapsed.expn)
+# dim(HLA.collapsed.expn) #1486   22
+# write.csv(HLA.collapsed.expn, "TARGET_AML_Ribodepleted_dx_AML_HLA.A.02_with_PRAME_TPM.csv", row.names = FALSE)
+```
+
+```{r}
+median(HLA.collapsed.expn$PRAME_TPM)
+IQR(HLA.collapsed.expn$PRAME_TPM)
+quantile(HLA.collapsed.expn$PRAME_TPM, probs=seq(0,1, length.out = 11), na.rm=TRUE)
+```
+
+
+```{r fig.height=5, fig.width=5}
+prame_hist <- ggplot(data=HLA.collapsed.expn, aes(x=Log2_PRAME_TPM)) +
+  geom_histogram(binwidth = 0.5, fill="blue",color="blue") +
+  geom_vline(xintercept = log2(1+1), color="grey",linetype="dashed") +
+  geom_vline(xintercept = log2(2+1), color="red",linetype="dashed") +
+  scale_x_continuous(breaks=seq(0, 10, by=1)) +
+  labs(y="Frequency of TPM Value", x="log2(TPM+1)", title="PRAME Expression Distribution") +
+  theme_bw() +
+  theme(text = element_text(size=14))
+
+
+# prame_hist
+# ggsave(plot=prame_hist, filename="TARGET_AML_PRAME_hist.pdf", device="pdf", height=4, width=5)
+```
+
+```{r fig.height=5, fig.width=10}
+abline_med <- which(HLA.collapsed.expn$PRAME_TPM >=0.76 & HLA.collapsed.expn$PRAME_TPM <= 0.761) # 0.7615819
+abline <- which(HLA.collapsed.expn$PRAME_TPM >=2.35 & HLA.collapsed.expn$PRAME_TPM <= 2.37)
+# abline <- which(HLA.collapsed.expn$PRAME_TPM >=0.997 & HLA.collapsed.expn$PRAME_TPM <= 1.01)
+# HLA.collapsed.expn$PRAME_TPM[abline_med]
+
+prame_waterfall <- ggplot(data=HLA.collapsed.expn, aes(x=Index, y=PRAME_TPM, 
+                                    fill=PRAME_Expn_Deciles, color=PRAME_Expn_Deciles)) +
+  geom_bar(stat="identity") +
+  scale_color_brewer(palette = "Set3") +
+  scale_fill_brewer(palette = "Set3") +
+  scale_x_discrete(expand=c(0.01,0.05))+
+  geom_vline(xintercept = abline, color="red", size=1.0, linetype="dashed") +
+  geom_vline(xintercept = abline_med, color="grey", size=1.0, linetype="dashed") +
+  
+  labs(y="TPM",x="Patient", title="PRAME Expression in Diagnostic AML") +
+  annotate(geom="text", x=300, y=250, label= "PRAME Positive Samples", size=3) +
+  theme_classic() +
+  guides(fill=guide_legend(title="PRAME Expression Deciles"), color=guide_legend(title="PRAME Expression Deciles")) +
+  theme(text=element_text(size=14),
+        legend.text = element_text(size=10),
+        axis.text.y=element_text(color="black"),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank())
+
+prame_waterfall
+# ggsave(plot=prame_waterfall, filename="TARGET_AML_PRAME_waterfall.pdf", height = 4, width = 8)
+```
+
+
+
+#Guassian Mixed Model For cut-off
+
+```{r}
+library("mixtools")
+
+set.seed(2020)
+prame <- pull(HLA.collapsed.expn, Log2_PRAME_TPM)
+
+#This is the standard EM algorithm for normal mixtures that maximizes the conditional expected complete-data log-likelihood at each M-step of the algorithm
+mixmdl <- normalmixEM(prame, k = 2, maxit=100,verb=TRUE,
+                      fast=TRUE,arbmean=TRUE)
+
+
+
+res <- data.frame(x = mixmdl$x)
+```
+
+```{r}
+mixmdl$lambda #	The final mixing proportions.
+mixmdl$mu #The final mean parameters.
+mixmdl$sigma #The final standard deviations.
+```
+
+```{r}
+post.df <- as.data.frame(cbind(x = mixmdl$x, mixmdl$posterior)) %>%
+    mutate(GMM_Group=ifelse(comp.2 >= 0.95, "High", "Low")) %>%
+  bind_cols(., HLA.collapsed.expn)
+
+head(post.df, 10)  # Retrieve first 10 rows
+# tail(post.df, 10)
+# View(post.df)
+```
+
+```{r}
+table(post.df$GMM_Group, post.df$PRAME_Expn_Median)
+```
+
+
+```{r}
+#https://tinyheero.github.io/2015/10/13/mixture-model.html
+plot_mix_comps <- function(x, mu, sigma, lam) {
+  lam * dnorm(x, mu, sigma)
+}
+
+ggplot(data=res) +
+  geom_histogram(aes(x, ..density..),
+                 binwidth = 0.1, colour = "black",
+                 fill = "white") +
+  stat_function(geom = "line", fun = plot_mix_comps,
+                args = list(mixmdl$mu[1], mixmdl$sigma[1], lam = mixmdl$lambda[1]),
+                colour = "red", lwd = 1.5) +
+  stat_function(geom = "line", fun = plot_mix_comps,
+                args = list(mixmdl$mu[2], mixmdl$sigma[2], lam = mixmdl$lambda[2]),
+                colour = "blue", lwd = 1.5) +
+  labs(y="Density",x="log2 PRAME TPM")
+```
+
+
+
+#Plot PRAME/HLA A*02 Frequency
+
+```{r}
+library(ggalluvial)
+```
+
+594 prame pos with 40th percentile (2.4 TPM)
+523 prame pos with 5TPM threshold
+704 prame pos with 1TPM threshold
+
+```{r}
+prame_vs_A.02 <- HLA.collapsed.expn %>% 
+  mutate(PRAME_Expn=PRAME_Expn_40pctile, 
+         Total=n()) %>%
+  
+  group_by(PRAME_Expn) %>%
+  mutate(Number_Expressors=n(),
+         Percent_Expressors=n()/Total*100) %>%
+  group_by(HLA.A.02,
+           Number_Expressors,Percent_Expressors,Total, add=TRUE) %>% 
+  summarize(N=n()) %>%
+  mutate(Percent_Per_PRAME_Group=(N/Number_Expressors)*100,
+         Percent_All_Commers=(N/Total)*100) %>% 
+  ungroup() %>% 
+  
+  mutate(PRAME_Expn=factor(PRAME_Expn, levels=c("No","Yes"))) %>% 
+  mutate(HLA.A.02=factor(HLA.A.02, levels=c("TRUE","FALSE")))
+
+prame_vs_A.02
+```
+
+15% of prame pos patients with 5 TPM threshold
+18.0% of prame pos patients with 40th percentile (N=268)
+21.3% of prame pos patients with 1 TPM threshold (N=317)
+22.67% of prame pos patients with median (N=337)
+
+```{r}
+is_alluvia_form(as.data.frame(prame_vs_A.02), axes = 1:3, silent = TRUE)
+```
+
+```{r}
+# xlab1 <-  paste(expression(PRAME >= 5),"TPM")
+# xlab1 <-  paste(expression(PRAME >= 2.4),"TPM")
+xlab1 <-  paste(expression(PRAME >= 1),"TPM")
+
+lab_prame_pos <- filter(prame_vs_A.02,PRAME_Expn=="Yes") %>% 
+  pull(Percent_Expressors) %>%
+  unique() %>% 
+  round(digits=2) %>%
+  paste0("(",.,"%)")
+
+lab_prame_neg <- filter(prame_vs_A.02,PRAME_Expn=="No") %>% 
+  pull(Percent_Expressors) %>%
+  unique() %>%
+  round(digits=2) %>%
+  paste0("(",.,"%)")
+
+
+lab_perPP <- filter(prame_vs_A.02,PRAME_Expn=="Yes", HLA.A.02=="TRUE") %>% 
+  pull(Percent_Per_PRAME_Group) %>% 
+  round(digits=2) %>%
+  paste0(.,"%\nPRAME Positive")
+
+prame_alluvial <- ggplot(as.data.frame(prame_vs_A.02),
+       aes(y = N, axis1 = PRAME_Expn, axis2 = HLA.A.02)) +
+  geom_alluvium(aes(fill = PRAME_Expn),
+                width = 1/6,
+                alpha=0.7) +
+  geom_stratum(width = 1/6, 
+               fill = c("firebrick","lightblue","lightblue","firebrick"),
+               color = NA,
+               alpha=0.9) +
+  geom_text(stat = "stratum", 
+             aes(label = after_stat(stratum)), 
+            size=6, color=c("white","black","black","white"),
+            fontface = "bold") +
+  scale_x_discrete(limits = c("PRAME_Expn", "HLA.A.02"),
+                   expand = c(.05, .05),
+                   labels=c(xlab1, 
+                            "HLA A*02")) +
+  annotate(geom = "text",label=lab_prame_pos,x=1,y=150, color="white", 
+           fontface="bold",size=6) +
+  annotate(geom = "text",label=lab_prame_neg,x=1,y=875, color="black",
+           fontface="bold",size=6) +
+  
+  annotate(geom = "text",label="(46.8%)",
+           x=2,y=1030, 
+           color="white", fontface="bold", size=6) +
+  annotate(geom = "text",label="(53.2%)", 
+           x=2,y=270, 
+           color="black", fontface="bold", size=6) +
+  
+  
+  annotate(geom = "text",label=lab_perPP,
+           x=1.2,y=550, 
+           color="white", fontface="bold", size=4) +
+  
+
+  scale_y_continuous(breaks=seq(0,1500, by=250)) +
+  scale_fill_manual(values = c("lightblue","red2")) +
+  
+  labs(x="",y="Number of Patients") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text = element_text(size=16),
+        axis.title = element_text(size=18),
+        plot.title = element_text(size=20)) +
+  ggtitle("Number of AML Patients Expressing PRAME")
+
+prame_alluvial
+```
+
+```{r}
+# pdf("TARGET_AML_PRAME_HLA_A.02_alluvial_plot_Median.pdf", height = 5, width = 8)
+prame_alluvial
+# dev.off()
+```
+
+
+
+#Session Information 
+
+```{r}
+sessionInfo()
+```
+

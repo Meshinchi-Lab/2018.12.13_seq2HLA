@@ -1,0 +1,243 @@
+---
+title: 'HLA-typing with RNAseq'
+author: "Jenny Smith"
+date: "January 3, 2019"
+output: html_document
+---
+
+
+
+```{r setup}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center', fig.height=5, fig.width=8)
+knitr::opts_knit$set(root.dir = '/fh/fast/meshinchi_s/workingDir/TARGET/AML_TARGET/RNA/mRNAseq/analysis/2018.12.13_seq2HLA/')
+options(stringsAsFactors = FALSE)
+```
+
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(tidyr)
+getwd()
+```
+
+
+
+#Read in the Clinical Data
+
+```{r}
+CDE <- read.csv("~/reference_mapping-files/TARGET_AML_0531_1031_merged_CDEs_10.29.18.csv")
+
+head(CDE[,1:5])
+dim(CDE)
+```
+
+```{r}
+run.table <- read.delim("SraRunTable_HighDepth.txt", sep="\t") %>%
+    mutate(USI=str_split_fixed(Sample_Name,"-", n=5)[,3]) %>%
+  select(USI, Sample_Name,Run, everything())
+
+# head(run.table)
+dim(run.table)
+```
+
+```{r}
+run.table_all <- read.delim("SraRunTable_2014.txt", sep="\t") %>%
+  bind_rows(., read.delim("SraRunTable_2015.txt", sep="\t")) %>%
+  mutate(USI=str_split_fixed(Sample_Name,"-", n=5)[,3]) %>%
+  filter(!is.na(AssemblyName)) %>%
+  filter(grepl("09A|03A", Sample_Name)) %>% #only diagnostic samples 
+  select(USI, Sample_Name,Run, everything())
+
+head(run.table_all[,1:5])
+dim(run.table_all) #160 by 41
+```
+
+```{r}
+seq.matrix <- read.csv("/fh/fast/meshinchi_s/workingDir/TARGET/AML_TARGET/SequencingDataMatrix/TARGET_AML_0531_1031_SeqDataAvailability_3.29.18.csv")
+
+head(seq.matrix[,1:5])
+dim(seq.matrix)
+```
+
+
+#Read in the Molecular HLA-typing
+
+```{r}
+mol.types <- read.csv("2015_08_10_HLAreport_Soheil.csv") %>%
+  filter(!is.na(Reg.No)) %>%
+  left_join(., select(CDE,Reg., USI=TARGET.USI.1), by=c("Reg.No"="Reg.")) 
+
+head(mol.types)
+dim(mol.types) #186 21
+
+length(unique(mol.types$USI)) #62
+```
+
+```{r}
+seq <- seq.matrix %>%
+  filter(USI %in% c(mol.types$USI, "PATENX")) %>%
+  select(USI, Protocol,contains("mRNA")) %>%
+  filter(mRNAseq.DataAvailable==1)
+
+head(seq[,1:5])
+dim(seq) #61 patients 
+```
+
+```{r}
+#7 +1  in the highdepth dataset
+#33 +1 in the low depth set. 
+table(seq$HighDepth_RNASeq.mRNAseq, seq$LowDepth_RNASeq.mRNAseq, useNA = "always") 
+```
+
+```{r}
+highDepth <- seq  %>%
+  filter(! (LowDepth_RNASeq.mRNAseq == 1 & HighDepth_RNASeq.mRNAseq ==1)) %>%
+  filter(HighDepth_RNASeq.mRNAseq ==1)
+
+dim(highDepth) #7 with high depth seq. 
+```
+
+```{r}
+sum(unique(mol.types$USI) %in% highDepth$USI)
+intersect(mol.types$USI, highDepth$USI)
+```
+
+```{r}
+lowDepth <- seq  %>%
+  filter(LowDepth_RNASeq.mRNAseq == 1) 
+
+
+# lowDepth
+
+length(lowDepth$USI)
+```
+
+
+
+#Run Seq2HLA Algorithm
+
+It is a command line program. https://github.com/TRON-Bioinformatics/seq2HLA/blob/master/seq2HLA.py 
+Uses the GIZMO enviorment modules
+- /usr/bin/python (for bioconda??)
+- Bowtie/1.1.1 
+- R/3.5
+
+
+First run will use the high depth RNAseq data. See run.table object for USIs. 
+SRR1294269
+SRR1294215
+SRR1294239
+SRR1294242
+SRR1286839
+SRR1286874
+SRR1286860
+
+
+Having some major issues with the results from an SRA fastq file!!! The readIDs are in the wrong format for the program and it looks like for some reason, changing the readIDs also causes the results to change?? 
+
+The classI 2-digit HLA-typing was more accurate when the SRA fastq was used in the original format.
+Changing literally only the .1 to /1 for readIDs in the fastqs lead to 1 allele being correct, while all the others were homozygous - and incorrect bc they were identical to 1 allele. 
+
+Will need to determine if its an error introduced in `sed` command or not. 
+
+
+
+#Concatenate the HLA-typing Resuls 
+
+```{r}
+source("~/scripts/conversion_scripts/Merge_Cat_FixDupIDs_Function.r")
+dir()
+```
+
+```{r}
+path <- "/fh/scratch/delete90/meshinchi_s/jlsmith3/seq2HLA/results/"
+files <- dir( path=path)
+length(files) #559
+```
+
+
+```{r}
+classI.2dig <- paste0(path, grep("ClassI-class.HLAgenotype2digit", files, value=TRUE))
+classI.4dig <- paste0(path,grep("ClassI-class.HLAgenotype4digits", files, value=TRUE))
+```
+
+```{r}
+classI.2dig.cated <- catRbind(filenames = classI.2dig , regex="^.+(PA[A-Z]{4}-[0-9]{2}A.+R)_.+", 
+                         header=TRUE, sep="\t")
+```
+
+```{r}
+classI.4dig.cated <- catRbind(filenames = classI.4dig , regex="^.+(PA[A-Z]{4}-[0-9]{2}A.+R)_.+", 
+                         header=TRUE, sep="\t")
+```
+
+
+
+#Compare to the calls from seq2HLA and Molecular Typing 
+
+```{r}
+classI.2dig.cated <- classI.2dig.cated %>%
+  select(Locus=X.Locus, everything()) %>%
+  rename_at(vars(2:5), funs(paste0(.,"_seq2HLA"))) %>%
+  mutate(USI=str_split_fixed(Patient, "-", n=3)[,1])
+
+classI.4dig.cated <- classI.4dig.cated %>%
+  select(Locus=X.Locus, everything()) %>%
+  rename_at(vars(2:5), funs(paste0(.,"_seq2HLA"))) %>%
+  mutate(USI=str_split_fixed(Patient, "-", n=3)[,1]) %>%
+  select(-Patient) 
+
+
+dim(classI.2dig.cated) #129
+dim(classI.4dig.cated) #129
+```
+
+```{r}
+length(classI.2dig.cated$USI)/3
+length(unique(classI.2dig.cated$USI))
+```
+
+```{r}
+res <- mol.types %>%
+  select(USI,Reg.No, everything()) %>%
+  right_join(., classI.2dig.cated, by=c("Locus","USI")) %>%
+  right_join(., classI.4dig.cated, by=c("Locus","USI"),suffix=c("_2Digit","_4Digit")) %>%
+  
+  mutate(SequencingDepth=ifelse(USI %in% lowDepth$USI, "Low", "High")) %>%
+         # mol_allele1_2D=substr(allele.1.exons.CI.1.7.CII.1.4, start=1, stop=4), 
+         # mol_allele2_2D=substr(allele.2.exons.CI.1.7.CII.1.4, start=1, stop=4), 
+         # mol_allele1_4D=substr(allele.1.exons.CI.1.7.CII.1.4, start=1, stop=7), 
+         # mol_allele2_4D=substr(allele.1.exons.CI.1.7.CII.1.4, start=1, stop=7),
+         # 
+         # rna_allele1_2D=) %>%
+  
+  select(USI,Reg.No, Locus,
+         matches("allele",ignore.case = TRUE),
+         SequencingDepth,
+         everything(), -matches("X\\.[0-9]"))
+
+head(res)
+dim(res)
+
+# write.csv(res,"TARGET_AML_0531_Seq2HLA_and_MolecularHLA.csv", row.names = FALSE)
+```
+
+
+```{r}
+table(res$SequencingDepth)
+```
+
+
+
+
+#Session Information 
+
+```{r}
+sessionInfo()
+```
+
